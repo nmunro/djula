@@ -170,37 +170,53 @@
         (walk dir)))
     (nreverse result)))
 
-(defun precompile-templates (&optional (template-store-or-directory *current-store*) (compiler *current-compiler*) &key extensions (error-p nil))
-  "Precompiles templates in TEMPLATE-STORE-OR-DIRECTORY using COMPILER.
-TEMPLATE-STORE-OR-DIRECTORY can be a TEMPLATE-STORE instance, a directory pathname/string, or a list of directory pathnames/strings.
-EXTENSIONS, if specified, is a list of file extensions (e.g. '(\"html\" \"djhtml\" \"txt\")) to compile.
+(defun precompile-templates (&rest args)
+  "Precompiles templates in a store or directory.
+Can be called with positional or keyword arguments:
+  (precompile-templates)
+  (precompile-templates directory &key compiler extensions error-p)
+  (precompile-templates store &key compiler extensions error-p)
+  (precompile-templates &key (store-or-directory *current-store*) (compiler *current-compiler*) extensions error-p)
 Returns the number of precompiled templates."
-  (let ((dirs (cond
-                ((typep template-store-or-directory 'filesystem-template-store)
-                 (search-path template-store-or-directory))
-                ((listp template-store-or-directory)
-                 template-store-or-directory)
-                (t
-                 (list template-store-or-directory))))
-        (count 0))
-    (dolist (dir dirs)
-      (let ((dir-path (uiop:ensure-directory-pathname dir)))
-        (when (uiop:directory-exists-p dir-path)
-          (dolist (file (%collect-template-files dir-path extensions))
-            (let ((rel (enough-namestring file dir-path)))
-              (flet ((do-compile ()
-                       (let ((compiled (compile-template compiler file error-p)))
-                         (when compiled
-                           (bordeaux-threads:with-recursive-lock-held (*compiler-lock*)
-                             (setf (gethash rel (template-cache compiler)) compiled))
-                           (incf count)))))
-                (if error-p
-                    (do-compile)
-                    (handler-case
-                        (do-compile)
-                      (error (e)
-                        (warn "Error precompiling template ~A: ~A" rel e))))))))))
-    count))
+  (let ((store-or-dir *current-store*)
+        (compiler *current-compiler*)
+        (extensions nil)
+        (error-p nil))
+    (let ((rest-args args))
+      (when (and rest-args (not (keywordp (first rest-args))))
+        (setf store-or-dir (pop rest-args)))
+      (loop for (key val) on rest-args by #'cddr do
+        (case key
+          ((:store-or-directory :template-store-or-directory) (setf store-or-dir val))
+          (:compiler (setf compiler val))
+          (:extensions (setf extensions val))
+          (:error-p (setf error-p val)))))
+    (let ((dirs (cond
+                  ((typep store-or-dir 'filesystem-template-store)
+                   (search-path store-or-dir))
+                  ((listp store-or-dir)
+                   store-or-dir)
+                  (t
+                   (list store-or-dir))))
+          (count 0))
+      (dolist (dir dirs)
+        (let ((dir-path (uiop:ensure-directory-pathname dir)))
+          (when (uiop:directory-exists-p dir-path)
+            (dolist (file (%collect-template-files dir-path extensions))
+              (let ((rel (enough-namestring file dir-path)))
+                (flet ((do-compile ()
+                         (let ((compiled (compile-template compiler file error-p)))
+                           (when compiled
+                             (bordeaux-threads:with-recursive-lock-held (*compiler-lock*)
+                               (setf (gethash rel (template-cache compiler)) compiled))
+                             (incf count)))))
+                  (if error-p
+                      (do-compile)
+                      (handler-case
+                          (do-compile)
+                        (error (e)
+                          (warn "Error precompiling template ~A: ~A" rel e))))))))))
+      count)))
 
 (defun render-template* (template &optional destination &rest *template-arguments*)
   "Render TEMPLATE into DESTINATION passing *TEMPLATE-ARGUMENTS*.
