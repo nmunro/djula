@@ -48,7 +48,11 @@
            #:add-template-directory
            #:set-static-url
            #:translate
-           #:*translation-backend*))
+           #:*translation-backend*
+           #:*compiler-lock*
+           #:clear-template-cache
+           #:precompile-templates
+           #:template-cache))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (unless (find-package "DJULA.TOKEN-PROCESSORS")

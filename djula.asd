@@ -22,6 +22,7 @@
                #:gettext
                #:parser-combinators
                #:iterate
+               #:bordeaux-threads
                #:uiop)
   :components
   ((:module :src

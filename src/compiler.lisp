@@ -1,10 +1,17 @@
 (in-package #:djula)
 
+(defvar *compiler-lock* (bordeaux-threads:make-recursive-lock "djula-compiler-lock")
+  "Recursive lock protecting template compilation and cache updates.")
+
 (defgeneric compile-template (compiler name &optional error-p)
   (:documentation "Provides a hook to customize template compilation."))
 
 (defclass compiler ()
-  ()
+  ((template-cache
+    :accessor template-cache
+    :initarg :template-cache
+    :initform (make-hash-table :test 'equal)
+    :documentation "A hash-table cache mapping template names/pathnames to compiled-template instances."))
   (:documentation "Abstract class. Top-level class for template compilers."))
 
 (defclass compiled-template ()
@@ -30,22 +37,24 @@
     (format stream "~A" (template-file compiled-template))))
 
 (defmethod compile-template-file ((compiled-template compiled-template))
-  ;; Set the template file write date
-  (setf (template-file-write-date compiled-template)
-        (file-write-date (template-file compiled-template)))
+  (bordeaux-threads:with-recursive-lock-held (*compiler-lock*)
+    ;; Set the template file write date
+    (setf (template-file-write-date compiled-template)
+          (file-write-date (template-file compiled-template)))
 
-  ;; Compile the template file
-  (let ((*block-alist* nil)
-        (*linked-templates* nil))
-    (let ((compiled-str
-            (compile-string (fetch-template* (template-file compiled-template)))))
-      (setf (compiled-template compiled-template) compiled-str
-            (linked-templates compiled-template) *linked-templates*))))
+    ;; Compile the template file
+    (let ((*block-alist* nil)
+          (*linked-templates* nil))
+      (let ((compiled-str
+              (compile-string (fetch-template* (template-file compiled-template)))))
+        (setf (compiled-template compiled-template) compiled-str
+              (linked-templates compiled-template) *linked-templates*)))))
 
 (defmethod template-changed ((compiled-template compiled-template))
-  (or (not (uiop:file-exists-p (template-file compiled-template)))
-      (not (= (template-file-write-date compiled-template)
-              (file-write-date (template-file compiled-template))))))
+  (let ((file (template-file compiled-template)))
+    (or (not (uiop:file-exists-p file))
+        (not (equalp (template-file-write-date compiled-template)
+                     (file-write-date file))))))
 
 (defmethod initialize-instance :after ((compiled-template compiled-template) &rest initargs)
   (declare (ignore initargs))
@@ -56,28 +65,71 @@
    compiled-template
    (if *recompile-templates-on-change*
        (lambda (stream)
-         ;; Recompile the template if the template-file has changed
-         (let ((template-file-write-date (template-file-write-date compiled-template)))
-           (when (or (not (equalp (file-write-date (template-file compiled-template))
-                                  template-file-write-date))
-                     (loop for linked-template in (linked-templates compiled-template)
-                             thereis (template-changed linked-template)))
-             (compile-template-file compiled-template)))
+         ;; Recompile the template if *recompile-templates-on-change* is enabled and files changed
+         (when *recompile-templates-on-change*
+           (let ((template-file-write-date (template-file-write-date compiled-template)))
+             (when (or (not (equalp (file-write-date (template-file compiled-template))
+                                    template-file-write-date))
+                       (loop for linked-template in (linked-templates compiled-template)
+                               thereis (template-changed linked-template)))
+               (bordeaux-threads:with-recursive-lock-held (*compiler-lock*)
+                 (let ((template-file-write-date (template-file-write-date compiled-template)))
+                   (when (or (not (equalp (file-write-date (template-file compiled-template))
+                                          template-file-write-date))
+                             (loop for linked-template in (linked-templates compiled-template)
+                                     thereis (template-changed linked-template)))
+                     (compile-template-file compiled-template)))))))
          (funcall (compiled-template compiled-template) stream))
        ;; else, avoid the automatic template file checking and recompilation
        (compiled-template compiled-template))))
 
 (defmethod compile-template ((compiler compiler) name &optional (error-p t))
-  (when-let ((template-file (find-template* name error-p)))
-    (make-instance 'compiled-template
-                   :template-file template-file)))
+  (bordeaux-threads:with-recursive-lock-held (*compiler-lock*)
+    (let ((cache (template-cache compiler)))
+      ;; 1. Check cache by name (or string/pathname alternative)
+      (let ((cached (or (gethash name cache)
+                        (and (pathnamep name) (gethash (namestring name) cache))
+                        (and (stringp name) (gethash (pathname name) cache)))))
+        (when cached
+          (when *recompile-templates-on-change*
+            (when (or (template-changed cached)
+                      (loop for linked-template in (linked-templates cached)
+                              thereis (template-changed linked-template)))
+              (compile-template-file cached)))
+          (return-from compile-template cached)))
+
+      ;; 2. Not in cache by name; resolve file
+      (when-let ((template-file (find-template* name error-p)))
+        ;; Check if template-file itself is in cache
+        (let ((cached (or (gethash template-file cache)
+                          (gethash (namestring template-file) cache))))
+          (if cached
+              (progn
+                (setf (gethash name cache) cached)
+                (when *recompile-templates-on-change*
+                  (when (or (template-changed cached)
+                            (loop for linked-template in (linked-templates cached)
+                                    thereis (template-changed linked-template)))
+                    (compile-template-file cached)))
+                cached)
+              (let ((compiled (make-instance 'compiled-template
+                                             :template-file template-file)))
+                (setf (gethash name cache) compiled)
+                (setf (gethash template-file cache) compiled)
+                (setf (gethash (namestring template-file) cache) compiled)
+                compiled)))))))
 
 (defclass toplevel-compiler (compiler)
   ((fragment-compiler
     :reader fragment-compiler
-    :initarg :fragment-compiler
-    :initform (make-instance 'compiler)))
+    :initarg :fragment-compiler))
   (:documentation "The default Djula template compiler."))
+
+(defmethod initialize-instance :after ((compiler toplevel-compiler) &rest initargs)
+  (declare (ignore initargs))
+  (unless (slot-boundp compiler 'fragment-compiler)
+    (setf (slot-value compiler 'fragment-compiler)
+          (make-instance 'compiler :template-cache (template-cache compiler)))))
 
 (defvar *current-compiler* (make-instance 'toplevel-compiler)
   "The current template compiler.")
@@ -91,6 +143,64 @@
 (defun compile-template* (name)
   "Compiles template NAME with compiler in *CURRENT-COMPILER*."
   (compile-template *current-compiler* name))
+
+(defun clear-template-cache (&optional (compiler *current-compiler*))
+  "Clears the template cache of COMPILER."
+  (bordeaux-threads:with-recursive-lock-held (*compiler-lock*)
+    (clrhash (template-cache compiler))
+    (when (and (typep compiler 'toplevel-compiler)
+               (slot-boundp compiler 'fragment-compiler))
+      (clrhash (template-cache (fragment-compiler compiler))))))
+
+(defun %collect-template-files (dir extensions)
+  (let ((dir (uiop:ensure-directory-pathname dir))
+        (result nil))
+    (when (uiop:directory-exists-p dir)
+      (labels ((walk (current-dir)
+                 (dolist (subdir (uiop:subdirectories current-dir))
+                   (walk subdir))
+                 (dolist (file (uiop:directory-files current-dir))
+                   (let ((name (file-namestring file))
+                         (type (pathname-type file)))
+                     (unless (or (alexandria:emptyp name)
+                                 (char= (char name 0) #\.))
+                       (when (or (null extensions)
+                                 (and type (member type extensions :test #'string-equal)))
+                         (push file result)))))))
+        (walk dir)))
+    (nreverse result)))
+
+(defun precompile-templates (&optional (template-store-or-directory *current-store*) (compiler *current-compiler*) &key extensions (error-p nil))
+  "Precompiles templates in TEMPLATE-STORE-OR-DIRECTORY using COMPILER.
+TEMPLATE-STORE-OR-DIRECTORY can be a TEMPLATE-STORE instance, a directory pathname/string, or a list of directory pathnames/strings.
+EXTENSIONS, if specified, is a list of file extensions (e.g. '(\"html\" \"djhtml\" \"txt\")) to compile.
+Returns the number of precompiled templates."
+  (let ((dirs (cond
+                ((typep template-store-or-directory 'filesystem-template-store)
+                 (search-path template-store-or-directory))
+                ((listp template-store-or-directory)
+                 template-store-or-directory)
+                (t
+                 (list template-store-or-directory))))
+        (count 0))
+    (dolist (dir dirs)
+      (let ((dir-path (uiop:ensure-directory-pathname dir)))
+        (when (uiop:directory-exists-p dir-path)
+          (dolist (file (%collect-template-files dir-path extensions))
+            (let ((rel (enough-namestring file dir-path)))
+              (flet ((do-compile ()
+                       (let ((compiled (compile-template compiler file error-p)))
+                         (when compiled
+                           (bordeaux-threads:with-recursive-lock-held (*compiler-lock*)
+                             (setf (gethash rel (template-cache compiler)) compiled))
+                           (incf count)))))
+                (if error-p
+                    (do-compile)
+                    (handler-case
+                        (do-compile)
+                      (error (e)
+                        (warn "Error precompiling template ~A: ~A" rel e))))))))))
+    count))
 
 (defun render-template* (template &optional destination &rest *template-arguments*)
   "Render TEMPLATE into DESTINATION passing *TEMPLATE-ARGUMENTS*.
